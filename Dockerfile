@@ -8,3 +8,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/llamacpp-affinity-proxy /llamacpp-affinity-proxy
 EXPOSE 8001
 ENTRYPOINT ["/llamacpp-affinity-proxy"]
+
+LABEL org.opencontainers.image.source="https://github.com/JochenLinnemann/llamacpp-affinity-proxy"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.description="Dynamic conversation-to-slot affinity proxy for llama.cpp"
