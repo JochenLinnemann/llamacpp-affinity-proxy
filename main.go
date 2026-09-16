@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -45,11 +46,13 @@ type config struct {
 	listenAddr string
 	backendURL *url.URL
 	slotCount  int
+	transport  http.RoundTripper
 }
 
 type affinityEntry struct {
 	conversationID string
 	lastUsed       time.Time
+	active         int
 }
 
 type affinityManager struct {
@@ -57,6 +60,7 @@ type affinityManager struct {
 	slots      []affinityEntry
 	convToSlot map[string]int
 	now        func() time.Time
+	waitCh     chan struct{}
 }
 
 type affinityResult struct {
@@ -81,6 +85,19 @@ type proxyServer struct {
 	affinity *affinityManager
 	proxy    *httputil.ReverseProxy
 }
+
+type slotLease struct {
+	manager *affinityManager
+	slot    int
+	once    sync.Once
+}
+
+type affinityReservation struct {
+	lease  *slotLease
+	result affinityResult
+}
+
+type reservationContextKey struct{}
 
 func main() {
 	cfg, err := loadConfig()
@@ -133,6 +150,11 @@ func getenvDefault(key, fallback string) string {
 func newProxyServer(cfg config) http.Handler {
 	affinity := newAffinityManager(cfg.slotCount)
 	proxy := httputil.NewSingleHostReverseProxy(cfg.backendURL)
+	transport := cfg.transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	proxy.Transport = &leasingTransport{base: transport}
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("backend error method=%s path=%s error=%v", req.Method, req.URL.Path, err)
 		http.Error(rw, "bad gateway", http.StatusBadGateway)
@@ -154,71 +176,109 @@ func newAffinityManager(slotCount int) *affinityManager {
 	return &affinityManager{
 		slots:      make([]affinityEntry, slotCount),
 		convToSlot: make(map[string]int, slotCount),
-		now:        time.Now().UTC,
+		now: func() time.Time {
+			return time.Now().UTC()
+		},
+		waitCh: make(chan struct{}),
 	}
 }
 
 func (m *affinityManager) Acquire(conversationID string) affinityResult {
-	result, _ := m.acquire(conversationID, nil)
-	return result
+	reservation, err := m.ReserveChecked(context.Background(), conversationID, nil)
+	if err != nil {
+		return affinityResult{}
+	}
+	reservation.lease.Release()
+	return reservation.result
 }
 
-func (m *affinityManager) AcquireChecked(conversationID string, explicitSlot *int) (affinityResult, error) {
-	return m.acquire(conversationID, explicitSlot)
+func (m *affinityManager) ReserveChecked(ctx context.Context, conversationID string, explicitSlot *int) (affinityReservation, error) {
+	for {
+		m.mu.Lock()
+		reservation, waitCh, err := m.tryReserveLocked(conversationID, explicitSlot)
+		m.mu.Unlock()
+		if err != nil {
+			return affinityReservation{}, err
+		}
+		if waitCh == nil {
+			return reservation, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return affinityReservation{}, ctx.Err()
+		case <-waitCh:
+		}
+	}
 }
 
-func (m *affinityManager) acquire(conversationID string, explicitSlot *int) (affinityResult, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+func (m *affinityManager) tryReserveLocked(conversationID string, explicitSlot *int) (affinityReservation, chan struct{}, error) {
 	now := m.now()
 	if explicitSlot != nil && (*explicitSlot < 0 || *explicitSlot >= len(m.slots)) {
-		return affinityResult{}, errInvalidExplicitSlot
+		return affinityReservation{}, nil, errInvalidExplicitSlot
 	}
 	if slot, ok := m.convToSlot[conversationID]; ok {
 		if explicitSlot != nil && *explicitSlot != slot {
-			return affinityResult{}, errConflictingExplicitSlot
+			return affinityReservation{}, nil, errConflictingExplicitSlot
 		}
 		m.slots[slot].lastUsed = now
-		return affinityResult{slot: slot, action: "reuse", lastUsed: now}, nil
+		m.slots[slot].active++
+		return affinityReservation{
+			lease:  &slotLease{manager: m, slot: slot},
+			result: affinityResult{slot: slot, action: "reuse", lastUsed: now},
+		}, nil, nil
 	}
 
 	if explicitSlot != nil {
 		slot := *explicitSlot
 		entry := m.slots[slot]
 		if entry.conversationID == "" {
-			m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now}
+			m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now, active: 1}
 			m.convToSlot[conversationID] = slot
-			return affinityResult{slot: slot, action: "assign", lastUsed: now}, nil
+			return affinityReservation{
+				lease:  &slotLease{manager: m, slot: slot},
+				result: affinityResult{slot: slot, action: "assign", lastUsed: now},
+			}, nil, nil
 		}
-		return affinityResult{}, errConflictingExplicitSlot
+		return affinityReservation{}, nil, errConflictingExplicitSlot
 	}
 
 	for slot, entry := range m.slots {
 		if entry.conversationID == "" {
-			m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now}
+			m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now, active: 1}
 			m.convToSlot[conversationID] = slot
-			return affinityResult{slot: slot, action: "assign", lastUsed: now}, nil
+			return affinityReservation{
+				lease:  &slotLease{manager: m, slot: slot},
+				result: affinityResult{slot: slot, action: "assign", lastUsed: now},
+			}, nil, nil
 		}
 	}
 
-	lruSlot := m.findLRUSlot()
-
+	lruSlot, ok := m.findEvictableLRUSlotLocked()
+	if !ok {
+		return affinityReservation{}, m.waitCh, nil
+	}
 	evicted := m.slots[lruSlot].conversationID
 	delete(m.convToSlot, evicted)
-	m.slots[lruSlot] = affinityEntry{conversationID: conversationID, lastUsed: now}
+	m.slots[lruSlot] = affinityEntry{conversationID: conversationID, lastUsed: now, active: 1}
 	m.convToSlot[conversationID] = lruSlot
-	return affinityResult{slot: lruSlot, action: "assign", evicted: evicted, lastUsed: now}, nil
+	return affinityReservation{
+		lease:  &slotLease{manager: m, slot: lruSlot},
+		result: affinityResult{slot: lruSlot, action: "assign", evicted: evicted, lastUsed: now},
+	}, nil, nil
 }
 
-func (m *affinityManager) findLRUSlot() int {
-	lruSlot := 0
-	for slot := 1; slot < len(m.slots); slot++ {
-		if m.slots[slot].lastUsed.Before(m.slots[lruSlot].lastUsed) {
+func (m *affinityManager) findEvictableLRUSlotLocked() (int, bool) {
+	lruSlot := -1
+	for slot, entry := range m.slots {
+		if entry.conversationID == "" || entry.active > 0 {
+			continue
+		}
+		if lruSlot == -1 || entry.lastUsed.Before(m.slots[lruSlot].lastUsed) {
 			lruSlot = slot
 		}
 	}
-	return lruSlot
+	return lruSlot, lruSlot >= 0
 }
 
 func (m *affinityManager) Snapshot() affinityView {
@@ -265,11 +325,15 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				http.Error(rw, err.Error(), http.StatusBadRequest)
 				return
 			}
-			affinity, err := s.affinity.AcquireChecked(normalizedID, explicitSlot)
+			reservation, err := s.affinity.ReserveChecked(req.Context(), normalizedID, explicitSlot)
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
 				http.Error(rw, err.Error(), http.StatusBadRequest)
 				return
 			}
+			affinity := reservation.result
 			logConversationID := redactConversationID(normalizedID)
 			if affinity.evicted == "" {
 				log.Printf("affinity conversation=%s slot=%d action=%s", logConversationID, affinity.slot, affinity.action)
@@ -280,9 +344,11 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				payload["id_slot"] = json.RawMessage(strconv.Itoa(affinity.slot))
 			}
 			if err := replaceRequestBody(req, payload); err != nil {
+				reservation.lease.Release()
 				http.Error(rw, err.Error(), http.StatusBadRequest)
 				return
 			}
+			req = req.WithContext(context.WithValue(req.Context(), reservationContextKey{}, reservation.lease))
 		}
 	}
 
@@ -394,6 +460,9 @@ func decodeRequestBody(req *http.Request) (map[string]json.RawMessage, *int, err
 	if err := decoder.Decode(&payload); err != nil {
 		return nil, nil, fmt.Errorf("invalid JSON request body: %w", err)
 	}
+	if payload == nil {
+		return nil, nil, errors.New("invalid JSON request body: top-level JSON value must be an object")
+	}
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil, nil, fmt.Errorf("invalid JSON request body: multiple JSON values are not supported")
@@ -442,4 +511,76 @@ func decodeExplicitSlot(raw json.RawMessage) (int, error) {
 		return 0, err
 	}
 	return parsed, nil
+}
+
+func (l *slotLease) Release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		l.manager.mu.Lock()
+		defer l.manager.mu.Unlock()
+		if l.slot < 0 || l.slot >= len(l.manager.slots) {
+			return
+		}
+		if l.manager.slots[l.slot].active > 0 {
+			l.manager.slots[l.slot].active--
+			l.manager.notifyWaitersLocked()
+		}
+	})
+}
+
+func (m *affinityManager) notifyWaitersLocked() {
+	close(m.waitCh)
+	m.waitCh = make(chan struct{})
+}
+
+type leasingTransport struct {
+	base http.RoundTripper
+}
+
+func (t *leasingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	transport := t.base
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+
+	lease, _ := req.Context().Value(reservationContextKey{}).(*slotLease)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		lease.Release()
+		return nil, err
+	}
+	if lease != nil && resp.Body != nil {
+		resp.Body = &releasingReadCloser{ReadCloser: resp.Body, release: lease.Release}
+	}
+	return resp, nil
+}
+
+type releasingReadCloser struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (r *releasingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		r.releaseOnce()
+	}
+	return n, err
+}
+
+func (r *releasingReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.releaseOnce()
+	return err
+}
+
+func (r *releasingReadCloser) releaseOnce() {
+	r.once.Do(func() {
+		if r.release != nil {
+			r.release()
+		}
+	})
 }

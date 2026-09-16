@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -167,6 +169,17 @@ func TestAffinityReuseUpdatesLRUOrder(t *testing.T) {
 	}
 }
 
+func TestAffinityDefaultClockAdvances(t *testing.T) {
+	manager := newAffinityManager(1)
+	first := manager.Acquire("hermes:abc")
+	time.Sleep(10 * time.Millisecond)
+	second := manager.Acquire("hermes:abc")
+
+	if !second.lastUsed.After(first.lastUsed) {
+		t.Fatalf("expected second timestamp %v to be after first %v", second.lastUsed, first.lastUsed)
+	}
+}
+
 func TestAffinityConcurrentAssignmentKeepsUniqueSlots(t *testing.T) {
 	const slotCount = 32
 	manager := newAffinityManager(slotCount)
@@ -232,6 +245,65 @@ func TestInjectsIDSlotIntoJSONRequest(t *testing.T) {
 	}
 	if payload["id_slot"] != float64(0) {
 		t.Fatalf("expected id_slot 0, got %#v", payload["id_slot"])
+	}
+}
+
+func TestGenerationEndpointsInjectSlotAndPreserveResponseMetadata(t *testing.T) {
+	paths := []string{
+		"/v1/chat/completions",
+		"/v1/completions",
+		"/v1/responses",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("read body: %v", err)
+				}
+				_ = req.Body.Close()
+				rw.Header().Set("Content-Type", "application/json")
+				rw.Header().Set("X-Backend", "ok")
+				rw.WriteHeader(http.StatusCreated)
+				_, _ = rw.Write(body)
+			}))
+			defer backend.Close()
+
+			server := newProxyTestServer(t, backend.URL, 4)
+			defer server.Close()
+
+			req, err := http.NewRequest(http.MethodPost, server.URL+path, strings.NewReader(`{"model":"test"}`))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(headerConversation, "chat-123")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("expected 201, got %d", resp.StatusCode)
+			}
+			if resp.Header.Get("Content-Type") != "application/json" {
+				t.Fatalf("unexpected content type %q", resp.Header.Get("Content-Type"))
+			}
+			if resp.Header.Get("X-Backend") != "ok" {
+				t.Fatalf("missing backend header, got %q", resp.Header.Get("X-Backend"))
+			}
+
+			var payload map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if payload["id_slot"] != float64(0) {
+				t.Fatalf("expected id_slot 0, got %#v", payload["id_slot"])
+			}
+		})
 	}
 }
 
@@ -478,6 +550,48 @@ func TestNullExplicitIDSlotGetsAssignedByProxy(t *testing.T) {
 	}
 }
 
+func TestInvalidBodiesReturnBadRequestWithoutChangingAffinity(t *testing.T) {
+	testCases := []struct {
+		name string
+		body string
+	}{
+		{name: "null", body: `null`},
+		{name: "array", body: `[]`},
+		{name: "malformed", body: `{"model":`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				t.Fatal("backend should not receive invalid request")
+			}))
+			defer backend.Close()
+
+			server := newProxyTestServer(t, backend.URL, 1)
+			defer server.Close()
+
+			req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(headerConversation, "chat-1")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d", resp.StatusCode)
+			}
+
+			assertNoAffinityEntries(t, server.URL)
+		})
+	}
+}
+
 func TestOversizedRewriteBodyReturnsBadRequest(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		t.Fatal("backend should not receive oversized request")
@@ -561,6 +675,185 @@ func TestStreamingResponsesForwardIncrementally(t *testing.T) {
 	}
 	if !strings.Contains(string(rest), "data: second") {
 		t.Fatalf("missing second chunk in %q", string(rest))
+	}
+}
+
+func TestOverlappingRequestsWaitForActiveSlotRelease(t *testing.T) {
+	firstArrived := make(chan struct{})
+	secondArrived := make(chan struct{})
+	releaseFirst := make(chan struct{})
+
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		switch req.Header.Get(headerConversation) {
+		case "owui:first":
+			close(firstArrived)
+			<-releaseFirst
+			rw.Header().Set("Content-Type", "application/json")
+			_, _ = rw.Write([]byte(`{"ok":true}`))
+		case "owui:second":
+			close(secondArrived)
+			rw.Header().Set("Content-Type", "application/json")
+			_, _ = rw.Write([]byte(`{"ok":true}`))
+		default:
+			t.Fatalf("unexpected conversation header %q", req.Header.Get(headerConversation))
+		}
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 1)
+	defer server.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(headerConversation, "first")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			firstDone <- err
+			return
+		}
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		firstDone <- err
+	}()
+
+	<-firstArrived
+
+	secondDone := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(headerConversation, "second")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			secondDone <- err
+			return
+		}
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		secondDone <- err
+	}()
+
+	select {
+	case <-secondArrived:
+		t.Fatal("second request reached backend before first request completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	select {
+	case <-secondArrived:
+	case <-time.After(time.Second):
+		t.Fatal("second request never reached backend after first completed")
+	}
+
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+}
+
+func TestCancellationReleasesActiveSlot(t *testing.T) {
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Header.Get(headerConversation) {
+		case "owui:first":
+			close(firstStarted)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		case "owui:second":
+			close(secondStarted)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		default:
+			t.Fatalf("unexpected conversation header %q", req.Header.Get(headerConversation))
+			return nil, nil
+		}
+	})
+
+	server := newProxyTestServerWithTransport(t, "http://backend.example", 1, transport)
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	firstErr := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(headerConversation, "first")
+		_, err := http.DefaultClient.Do(req)
+		firstErr <- err
+	}()
+
+	<-firstStarted
+
+	secondDone := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(headerConversation, "second")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			secondDone <- err
+			return
+		}
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		secondDone <- err
+	}()
+
+	select {
+	case <-secondStarted:
+		t.Fatal("second request reached backend before cancellation released the slot")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+
+	if err := <-firstErr; err == nil {
+		t.Fatal("expected canceled first request to return an error")
+	}
+
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second request never reached backend after cancellation")
+	}
+
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+}
+
+func TestBackendFailureReturnsBadGateway(t *testing.T) {
+	server := newProxyTestServerWithTransport(t, "http://backend.example", 1, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("backend unavailable")
+	}))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerConversation, "chat-1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", resp.StatusCode)
 	}
 }
 
@@ -677,6 +970,20 @@ func newProxyTestServer(t *testing.T, backend string, slotCount int) *httptest.S
 	}))
 }
 
+func newProxyTestServerWithTransport(t *testing.T, backend string, slotCount int, transport http.RoundTripper) *httptest.Server {
+	t.Helper()
+	backendURL, err := url.Parse(backend)
+	if err != nil {
+		t.Fatalf("parse backend URL: %v", err)
+	}
+	return httptest.NewServer(newProxyServer(config{
+		listenAddr: ":0",
+		backendURL: backendURL,
+		slotCount:  slotCount,
+		transport:  transport,
+	}))
+}
+
 func sortedConversations(view affinityView) []string {
 	conversations := make([]string, 0, len(view.Slots))
 	for _, slot := range view.Slots {
@@ -686,4 +993,28 @@ func sortedConversations(view affinityView) []string {
 	}
 	sort.Strings(conversations)
 	return conversations
+}
+
+func assertNoAffinityEntries(t *testing.T, serverURL string) {
+	t.Helper()
+
+	resp, err := http.Get(serverURL + "/_affinity")
+	if err != nil {
+		t.Fatalf("get affinity: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var view affinityView
+	if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
+		t.Fatalf("decode affinity: %v", err)
+	}
+	if got := sortedConversations(view); len(got) != 0 {
+		t.Fatalf("expected no affinity entries, got %#v", got)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
