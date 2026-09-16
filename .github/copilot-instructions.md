@@ -1,0 +1,50 @@
+# GitHub Copilot – Repository Instructions
+
+This repository is a governance framework for AI-assisted development.
+Prefer minimal, incremental changes. Keep solutions simple and explicit.
+
+## Sources of truth (read first)
+- README.md
+- ARCHITECTURE.md
+- DECISIONS.md
+- ai/README.md
+- ai/rules.md
+- ai/context.md
+- ai/workflow.md
+- ai/checklists/
+
+## Working style
+- Ask clarifying questions when context is missing.
+- Prefer existing patterns in this repo over “best practice” rewrites.
+- Minimize dependencies and operational complexity.
+- Surface uncertainty explicitly and propose verification steps.
+
+## Guardrails
+- Do not introduce new frameworks without explicit request.
+- Do not make large refactors without an agreed plan.
+- Do not generate or request secrets. Never include credentials in code or logs.
+- Treat security/auth/permissions changes as high risk: require human review.
+
+## Quality gates
+Before proposing a PR-ready change, use relevant checklists:
+- ai/checklists/security.md
+- ai/checklists/reliability.md
+- ai/checklists/performance.md
+- ai/checklists/pr_review.md
+
+If any checklist item is intentionally not met, document reason, risk, mitigation.
+
+## Operational workflow (important)
+All AI agents MUST follow the collaboration and PR workflow defined in:
+- **ai/workflow.md**
+
+This includes:
+- PR size guardrails
+- single-branch iteration rules
+- Fix Pack handling for review feedback
+- Definition of Done for agent PRs
+
+## Notes
+RETRO.md is a shared space for reflective notes.
+Only add entries to RETRO.md when explicitly invited by a human.
+Do not treat notes as tasks, decisions, or recommendations.
