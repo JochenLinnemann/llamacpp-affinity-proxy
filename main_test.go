@@ -355,6 +355,64 @@ func TestAffinityEndpoint(t *testing.T) {
 	}
 }
 
+func TestNonGenerationRequestStillUpdatesAffinity(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 1)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set(headerHermes, "abc")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	resp.Body.Close()
+
+	affinityResp, err := http.Get(server.URL + "/_affinity")
+	if err != nil {
+		t.Fatalf("get affinity: %v", err)
+	}
+	defer affinityResp.Body.Close()
+
+	var view affinityView
+	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
+		t.Fatalf("decode affinity: %v", err)
+	}
+	if got := sortedConversations(view); len(got) != 1 || got[0] != "hermes:abc" {
+		t.Fatalf("unexpected affinity view: %#v", got)
+	}
+}
+
+func TestAffinityEndpointRejectsUntrustedCaller(t *testing.T) {
+	backendURL, err := url.Parse("http://backend.example")
+	if err != nil {
+		t.Fatalf("parse backend URL: %v", err)
+	}
+	handler := newProxyServer(config{
+		listenAddr: ":0",
+		backendURL: backendURL,
+		slotCount:  1,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/_affinity", nil)
+	req.RemoteAddr = "198.51.100.10:1234"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+}
+
 func newProxyTestServer(t *testing.T, backend string, slotCount int) *httptest.Server {
 	t.Helper()
 	backendURL, err := url.Parse(backend)

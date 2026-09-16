@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -229,11 +231,19 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.Header.Set(headerConversation, normalizedID)
 	}
 
-	if hasConversation && shouldInjectSlot(req) {
-		payload, explicitSlot, err := decodeRequestBody(req)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusBadRequest)
-			return
+	if hasConversation {
+		needsInjection := shouldInjectSlot(req)
+		var (
+			payload      map[string]json.RawMessage
+			explicitSlot *int
+			err          error
+		)
+		if needsInjection {
+			payload, explicitSlot, err = decodeRequestBody(req)
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 
 		affinity, err := s.affinity.AcquireChecked(normalizedID, explicitSlot)
@@ -241,18 +251,21 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
+		logConversationID := redactConversationID(normalizedID)
 		if affinity.evicted == "" {
-			log.Printf("affinity conversation=%s slot=%d action=%s", normalizedID, affinity.slot, affinity.action)
+			log.Printf("affinity conversation=%s slot=%d action=%s", logConversationID, affinity.slot, affinity.action)
 		} else {
-			log.Printf("affinity conversation=%s slot=%d action=%s evicted=%s", normalizedID, affinity.slot, affinity.action, affinity.evicted)
+			log.Printf("affinity conversation=%s slot=%d action=%s evicted=%s", logConversationID, affinity.slot, affinity.action, redactConversationID(affinity.evicted))
 		}
 
-		if explicitSlot == nil {
-			payload["id_slot"] = json.RawMessage(strconv.Itoa(affinity.slot))
-		}
-		if err := replaceRequestBody(req, payload); err != nil {
-			http.Error(rw, err.Error(), http.StatusBadRequest)
-			return
+		if needsInjection {
+			if explicitSlot == nil {
+				payload["id_slot"] = json.RawMessage(strconv.Itoa(affinity.slot))
+			}
+			if err := replaceRequestBody(req, payload); err != nil {
+				http.Error(rw, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 	}
 
@@ -264,10 +277,18 @@ func (s *proxyServer) handleHealth(rw http.ResponseWriter, _ *http.Request) {
 	_, _ = rw.Write([]byte("ok\n"))
 }
 
-func (s *proxyServer) handleAffinity(rw http.ResponseWriter, _ *http.Request) {
+func (s *proxyServer) handleAffinity(rw http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !isTrustedDiagnosticsCaller(req.RemoteAddr) {
+		http.Error(rw, "forbidden", http.StatusForbidden)
+		return
+	}
 	rw.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(rw).Encode(s.affinity.Snapshot()); err != nil {
-		log.Printf("backend error method=GET path=/_affinity error=%v", err)
+		log.Printf("diagnostics error method=GET path=/_affinity error=%v", err)
 	}
 }
 
@@ -300,6 +321,27 @@ func hasNamespace(value string) bool {
 		}
 	}
 	return false
+}
+
+func redactConversationID(conversationID string) string {
+	namespace := "conversation"
+	if parts := strings.SplitN(conversationID, ":", 2); len(parts) == 2 && parts[0] != "" {
+		namespace = strings.ToLower(parts[0])
+	}
+	sum := sha256.Sum256([]byte(conversationID))
+	return fmt.Sprintf("%s:%x", namespace, sum[:6])
+}
+
+func isTrustedDiagnosticsCaller(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
 }
 
 func shouldInjectSlot(req *http.Request) bool {

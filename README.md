@@ -19,6 +19,7 @@ The proxy forwards requests to:
 - evicts the least recently used conversation when all slots are busy
 - injects `id_slot` into JSON bodies for supported generation endpoints
 - transparently proxies streaming responses without buffering the full response
+- logs slot-affinity decisions without printing raw conversation IDs
 
 Supported generation endpoints:
 
@@ -137,7 +138,7 @@ Clients must send one of these headers. The proxy does not infer stable conversa
 ## Diagnostics
 
 - `GET /health` returns `200 OK` when the proxy process is healthy
-- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps
+- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps for trusted callers on loopback or private network addresses
 
 Example:
 
@@ -165,6 +166,7 @@ Example:
 - concurrency-safe in-memory slot table guarded by a mutex
 - request-body rewriting only for supported JSON generation endpoints
 - transparent streaming from backend to client
+- diagnostics restricted to local/private callers, with redacted conversation identifiers in logs
 
 ## Limitations
 
