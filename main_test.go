@@ -857,6 +857,55 @@ func TestBackendFailureReturnsBadGateway(t *testing.T) {
 	}
 }
 
+func TestEarlyProxyAbortReleasesReservation(t *testing.T) {
+	handler := newProxyServer(config{
+		listenAddr: ":0",
+		backendURL: mustParseURL(t, "http://backend.example"),
+		slotCount:  1,
+		transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		}),
+	})
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstReq.Header.Set(headerConversation, "first")
+	firstReq.Header.Set("Connection", "Upgrade")
+	firstReq.Header.Set("Upgrade", string([]byte{0x7f}))
+	firstRec := httptest.NewRecorder()
+
+	handler.ServeHTTP(firstRec, firstReq)
+
+	if firstRec.Code != http.StatusBadGateway {
+		t.Fatalf("expected early proxy abort to return 502, got %d", firstRec.Code)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondReq.Header.Set(headerConversation, "second")
+	secondRec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(secondRec, secondReq)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("second request blocked after early proxy abort")
+	}
+
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("expected second request to succeed, got %d", secondRec.Code)
+	}
+}
+
 func TestAffinityEndpoint(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
@@ -972,13 +1021,9 @@ func newProxyTestServer(t *testing.T, backend string, slotCount int) *httptest.S
 
 func newProxyTestServerWithTransport(t *testing.T, backend string, slotCount int, transport http.RoundTripper) *httptest.Server {
 	t.Helper()
-	backendURL, err := url.Parse(backend)
-	if err != nil {
-		t.Fatalf("parse backend URL: %v", err)
-	}
 	return httptest.NewServer(newProxyServer(config{
 		listenAddr: ":0",
-		backendURL: backendURL,
+		backendURL: mustParseURL(t, backend),
 		slotCount:  slotCount,
 		transport:  transport,
 	}))
@@ -1017,4 +1062,13 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse backend URL: %v", err)
+	}
+	return parsed
 }

@@ -333,6 +333,7 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				http.Error(rw, err.Error(), http.StatusBadRequest)
 				return
 			}
+			defer reservation.lease.Release()
 			affinity := reservation.result
 			logConversationID := redactConversationID(normalizedID)
 			if affinity.evicted == "" {
