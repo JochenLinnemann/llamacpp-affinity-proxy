@@ -55,4 +55,4 @@ Request flow:
 - No writable filesystem state required.
 - Must support streaming responses without buffering the whole response.
 - Must not log prompts, API keys, authorization headers, or message bodies.
-- `/_affinity` is intended for trusted local/private-network callers only.
+- `/_affinity` is intended for loopback callers only.

@@ -244,21 +244,17 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				http.Error(rw, err.Error(), http.StatusBadRequest)
 				return
 			}
-		}
-
-		affinity, err := s.affinity.AcquireChecked(normalizedID, explicitSlot)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusBadRequest)
-			return
-		}
-		logConversationID := redactConversationID(normalizedID)
-		if affinity.evicted == "" {
-			log.Printf("affinity conversation=%s slot=%d action=%s", logConversationID, affinity.slot, affinity.action)
-		} else {
-			log.Printf("affinity conversation=%s slot=%d action=%s evicted=%s", logConversationID, affinity.slot, affinity.action, redactConversationID(affinity.evicted))
-		}
-
-		if needsInjection {
+			affinity, err := s.affinity.AcquireChecked(normalizedID, explicitSlot)
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusBadRequest)
+				return
+			}
+			logConversationID := redactConversationID(normalizedID)
+			if affinity.evicted == "" {
+				log.Printf("affinity conversation=%s slot=%d action=%s", logConversationID, affinity.slot, affinity.action)
+			} else {
+				log.Printf("affinity conversation=%s slot=%d action=%s evicted=%s", logConversationID, affinity.slot, affinity.action, redactConversationID(affinity.evicted))
+			}
 			if explicitSlot == nil {
 				payload["id_slot"] = json.RawMessage(strconv.Itoa(affinity.slot))
 			}
@@ -282,7 +278,7 @@ func (s *proxyServer) handleAffinity(rw http.ResponseWriter, req *http.Request) 
 		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isTrustedDiagnosticsCaller(req.RemoteAddr) {
+	if !isLoopbackDiagnosticsCaller(req.RemoteAddr) {
 		http.Error(rw, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -332,7 +328,7 @@ func redactConversationID(conversationID string) string {
 	return fmt.Sprintf("%s:%x", namespace, sum[:6])
 }
 
-func isTrustedDiagnosticsCaller(remoteAddr string) bool {
+func isLoopbackDiagnosticsCaller(remoteAddr string) bool {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		host = remoteAddr
@@ -341,7 +337,7 @@ func isTrustedDiagnosticsCaller(remoteAddr string) bool {
 	if ip == nil {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsPrivate()
+	return ip.IsLoopback()
 }
 
 func shouldInjectSlot(req *http.Request) bool {

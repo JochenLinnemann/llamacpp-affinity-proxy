@@ -138,7 +138,7 @@ Clients must send one of these headers. The proxy does not infer stable conversa
 ## Diagnostics
 
 - `GET /health` returns `200 OK` when the proxy process is healthy
-- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps for trusted callers on loopback or private network addresses
+- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps for loopback callers only
 
 Example:
 
@@ -164,9 +164,9 @@ Example:
 - standard-library HTTP server using `net/http`
 - standard-library reverse proxy using `httputil.ReverseProxy`
 - concurrency-safe in-memory slot table guarded by a mutex
-- request-body rewriting only for supported JSON generation endpoints
+- slot assignment and request-body rewriting only for supported JSON generation endpoints
 - transparent streaming from backend to client
-- diagnostics restricted to local/private callers, with redacted conversation identifiers in logs
+- diagnostics restricted to loopback callers, with redacted conversation identifiers in logs
 
 ## Limitations
 

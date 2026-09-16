@@ -14,5 +14,5 @@ The goal is clarity, not perfection.
 **Status:** Accepted  
 **Context:** Stable affinity requires a conversation identifier, but inferring one from arbitrary request bodies would add coupling to client payload formats and risk incorrect routing.  
 **Decision:** Accept stable IDs only from `X-Conversation-Id`, `X-Hermes-Session-Id`, and `X-KiloCode-TaskId`, and normalize them into `X-Conversation-Id` for the backend.  
-**Consequences:** Integration stays explicit and predictable. Clients must send one of the supported headers or the proxy will forward requests without dynamic `id_slot` injection. Diagnostics that expose raw conversation IDs are limited to trusted callers, and operational logs use redacted conversation identifiers.  
+**Consequences:** Integration stays explicit and predictable. Clients must send one of the supported headers or the proxy will forward requests without dynamic `id_slot` injection. Diagnostics that expose raw conversation IDs are limited to loopback callers, and operational logs use redacted conversation identifiers.  
 **Date:** 2026-09-16

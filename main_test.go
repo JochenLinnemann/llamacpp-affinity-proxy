@@ -355,7 +355,7 @@ func TestAffinityEndpoint(t *testing.T) {
 	}
 }
 
-func TestNonGenerationRequestStillUpdatesAffinity(t *testing.T) {
+func TestNonGenerationRequestPassesThroughWithoutUpdatingAffinity(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	}))
@@ -386,7 +386,7 @@ func TestNonGenerationRequestStillUpdatesAffinity(t *testing.T) {
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 1 || got[0] != "hermes:abc" {
+	if got := sortedConversations(view); len(got) != 0 {
 		t.Fatalf("unexpected affinity view: %#v", got)
 	}
 }
