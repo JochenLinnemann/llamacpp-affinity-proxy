@@ -256,6 +256,8 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	normalizedID, hasConversation := normalizeConversationID(req.Header)
 	if hasConversation {
 		req.Header.Set(headerConversation, normalizedID)
+		req.Header.Del(headerHermes)
+		req.Header.Del(headerKilo)
 	}
 
 	if hasConversation {
@@ -428,15 +430,21 @@ func replaceRequestBody(req *http.Request, payload map[string]json.RawMessage) e
 }
 
 func decodeExplicitSlot(raw json.RawMessage) (int, error) {
-	var number json.Number
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&number); err != nil {
-		return 0, err
+	value := strings.TrimSpace(string(raw))
+	if value == "" {
+		return 0, errInvalidExplicitSlot
 	}
-	value, err := strconv.Atoi(number.String())
+	for index, r := range value {
+		if r == '-' && index == 0 {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return 0, errInvalidExplicitSlot
+		}
+	}
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return 0, err
 	}
-	return value, nil
+	return parsed, nil
 }

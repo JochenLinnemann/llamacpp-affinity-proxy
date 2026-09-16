@@ -55,6 +55,45 @@ func TestNormalizeConversationIDDoesNotDoublePrefix(t *testing.T) {
 	}
 }
 
+func TestProxyForwardsOnlyNormalizedConversationHeader(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"conversation": req.Header.Get(headerConversation),
+			"hermes":       req.Header.Get(headerHermes),
+			"kilo":         req.Header.Get(headerKilo),
+		})
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 4)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set(headerHermes, "session-123")
+	req.Header.Set(headerKilo, "task-123")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var payload map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["conversation"] != "hermes:session-123" {
+		t.Fatalf("expected normalized conversation header, got %#v", payload)
+	}
+	if payload["hermes"] != "" || payload["kilo"] != "" {
+		t.Fatalf("expected source headers to be removed, got %#v", payload)
+	}
+}
+
 func TestAffinityExistingConversationGetsSameSlot(t *testing.T) {
 	manager := newAffinityManager(4)
 	first := manager.Acquire("hermes:abc")
@@ -353,6 +392,33 @@ func TestNegativeExplicitIDSlotReturnsBadRequest(t *testing.T) {
 	defer server.Close()
 
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test","id_slot":-1}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerConversation, "chat-1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestScientificNotationExplicitIDSlotReturnsBadRequest(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		t.Fatal("backend should not receive invalid request")
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 4)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test","id_slot":1e0}`))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
