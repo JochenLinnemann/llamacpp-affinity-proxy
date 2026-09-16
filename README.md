@@ -1,129 +1,200 @@
-# Project Name
+# llamacpp-affinity-proxy
 
-This repository is a **thinking framework**, not a runtime scaffold.
+`llamacpp-affinity-proxy` is a small Go reverse proxy that sits in front of `llama.cpp` and assigns a stable `id_slot` to each conversation.
 
-It exists to help teams use generative AI **deliberately, responsibly, and with clear intent** — minimizing accidental complexity while making tradeoffs explicit.
+Clients keep talking to:
 
-Empty files in this repository are intentional.  
-They create space for decisions *as they are made*, not pressure to document everything up front.
+`http://llamacpp:8001`
 
----
+The proxy forwards requests to:
 
-## What This Repository Is
+`http://llcpp-backend:8801`
 
-This repository is a **governance framework for AI-assisted software development**.
+## What it does
 
-It provides:
-- Shared norms for how AI is used (and where it should not be used)
-- Lightweight structures for documenting decisions and tradeoffs
-- Checklists that act as practical quality gates
-- Prompt guidance that teaches teams how to think, not just what to ask
+- normalizes conversation headers into `X-Conversation-Id`
+- keeps an in-memory `conversation -> slot` affinity table
+- reuses existing slots for returning conversations
+- assigns free slots to new conversations
+- evicts the least recently used conversation when all slots are busy
+- injects `id_slot` into JSON bodies for supported generation endpoints
+- transparently proxies streaming responses without buffering the full response
 
-Think of it as a **constitution**, not a construction manual.
+Supported generation endpoints:
 
----
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /v1/responses`
 
-## What This Repository Is Not
+Additional endpoints:
 
-This repository does **not**:
-- Scaffold a working application
-- Assume a programming language, framework, or cloud provider
-- Provide a runnable example service
-- Replace your existing repository structure
+- `GET /health`
+- `GET /_affinity`
 
-It is intentionally **language-agnostic, stack-agnostic, and tool-agnostic**.
+Other routes are transparently proxied.
 
----
+## Conversation header normalization
 
-## How to Use This Repository
+Headers are checked in this priority order:
 
-You do not “fill this out” all at once.  
-You adopt it **incrementally**, as the system and team evolve.
+1. `X-Conversation-Id`
+2. `X-Hermes-Session-Id`
+3. `X-KiloCode-TaskId`
 
-### Option 1: Overlay on an Existing Repository (Recommended)
+Normalization rules:
 
-1. Copy the `ai/` directory into your existing repo
-2. Reference the checklists during PR reviews
-3. Use the prompt templates to structure AI interactions
-4. Add entries to `DECISIONS.md` as real decisions are made
+- `X-Conversation-Id: <id>` -> `owui:<id>` unless already namespaced
+- `X-Hermes-Session-Id: <id>` -> `hermes:<id>`
+- `X-KiloCode-TaskId: <id>` -> `kilo:<id>`
+- already namespaced values such as `owui:...`, `hermes:...`, and `kilo:...` are forwarded unchanged
 
-This works especially well for brownfield systems.
+If no supported conversation header is present, the proxy does not inject `id_slot`.
 
----
+## Slot affinity behavior
 
-### Option 2: Start a New Repository with It
+Configure the number of backend slots with `SLOT_COUNT`.
 
-1. Create a new repo from this template
-2. Add code under `src/` and `tests/`
-3. Keep documentation lightweight until it provides value
-4. Let `DECISIONS.md` and `ROADMAP.md` grow organically over time
+- existing conversations always reuse their slot
+- new conversations take a free slot when available
+- when all slots are busy, the least recently used conversation is evicted
+- affinity state is in memory only and is lost on restart
+- KV-cache save/restore is intentionally out of scope for v1
 
-Avoid filling files “just to fill them.”
+## Configuration
 
----
+Environment variables:
 
-### Option 3: Partial Adoption
+- `LISTEN_ADDR` default `:8001`
+- `BACKEND_URL` default `http://llcpp-backend:8801`
+- `SLOT_COUNT` default `4`
 
-You can adopt only what you need:
-- Just the AI checklists
-- Just the prompt structure
-- Just the decision log
+The proxy validates configuration on startup and exits with a clear error for invalid values.
 
-Partial adoption is expected and supported.
+## Docker Compose example
 
----
+```yaml
+services:
+  llamacpp:
+    build:
+      context: ./llamacpp-affinity-proxy
+    container_name: llamacpp
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      BACKEND_URL: http://llcpp-backend:8801
+      SLOT_COUNT: "4"
+    depends_on:
+      - llcpp-backend
 
-## Project Overview
+  llcpp-backend:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    container_name: llcpp-backend
+    restart: unless-stopped
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8801"
+      - --parallel
+      - "4"
+```
 
-Use this section to describe *your* project:
+Do not publish port `8801` to the host unless you explicitly need it for debugging.
 
-- What problem it solves
-- Who it is for
-- What success looks like
+## Client examples
 
-This repository is structured to support **human + AI collaboration** while prioritizing simplicity, maintainability, and responsible use of infrastructure resources.
+### OpenWebUI
 
----
+Send:
 
-## Goals
+`X-Conversation-Id: owui:{{CHAT_ID}}`
 
-- Make intent and tradeoffs explicit
-- Encourage small, incremental changes
-- Keep operational impact visible
-- Enable safe, transparent AI assistance
+If OpenWebUI sends the raw chat ID instead, the proxy prefixes it with `owui:`.
 
----
+### Hermes
 
-## Non-Goals
+Send:
 
-- Premature optimization
-- Over-engineering
-- Undocumented “magic”
-- AI-driven decision-making without human accountability
+`X-Hermes-Session-Id: <stable-session-id>`
 
----
+The proxy forwards:
 
-## Getting Started
+`X-Conversation-Id: hermes:<stable-session-id>`
 
-Document how to:
-- Run the project locally
-- Execute tests
-- Deploy (if applicable)
+### Kilo
 
-Keep this practical and minimal.
+Send:
 
----
+`X-KiloCode-TaskId: <stable-task-id>`
 
-## Key Documentation
+The proxy forwards:
 
-- Architecture overview: `ARCHITECTURE.md`
-- Architectural decisions: `DECISIONS.md`
-- AI usage guidance: `ai/README.md`
+`X-Conversation-Id: kilo:<stable-task-id>`
 
----
+Clients must send one of these headers. The proxy does not infer stable conversation IDs from the request body.
 
-## Quick Reference
-- 📋 [Checklists](ai/checklists/) — Review and quality gates
-- 💬 [Prompt Templates](ai/prompts/) — Structure AI interactions
-- ⚙️ [Operations Guides](ops/) — Alerts, monitoring, and runbooks
-- 🪞 [RETRO.md](RETRO.md) — Shared retrospective notes from human–AI collaboration
+## Diagnostics
+
+- `GET /health` returns `200 OK` when the proxy process is healthy
+- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps
+
+Example:
+
+```json
+{
+  "slot_count": 4,
+  "slots": [
+    {
+      "slot": 0,
+      "conversation_id": "hermes:abc",
+      "last_used": "2026-09-16T14:00:00Z"
+    },
+    {
+      "slot": 1,
+      "conversation_id": null
+    }
+  ]
+}
+```
+
+## Architecture summary
+
+- standard-library HTTP server using `net/http`
+- standard-library reverse proxy using `httputil.ReverseProxy`
+- concurrency-safe in-memory slot table guarded by a mutex
+- request-body rewriting only for supported JSON generation endpoints
+- transparent streaming from backend to client
+
+## Limitations
+
+Version 1 intentionally does not implement:
+
+- KV save/restore
+- persistent affinity storage
+- Redis or database state
+- authentication
+- Prometheus metrics
+- automatic conversation detection from prompts or messages
+- retries on different slots
+
+## Local development
+
+Run tests:
+
+```bash
+go test ./...
+go vet ./...
+```
+
+Build:
+
+```bash
+go build ./...
+```
+
+Run locally:
+
+```bash
+LISTEN_ADDR=:8001 BACKEND_URL=http://localhost:8801 SLOT_COUNT=4 go run .
+```
