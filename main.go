@@ -22,9 +22,11 @@ import (
 )
 
 const (
-	headerConversation = "X-Conversation-Id"
-	headerHermes       = "X-Hermes-Session-Id"
-	headerKilo         = "X-KiloCode-TaskId"
+	headerConversation                  = "X-Conversation-Id"
+	headerHermes                        = "X-Hermes-Session-Id"
+	headerKilo                          = "X-KiloCode-TaskId"
+	defaultReadHeaderTimeout            = 10 * time.Second
+	defaultBackendResponseHeaderTimeout = 5 * time.Minute
 )
 
 var supportedNamespaces = []string{"owui:", "hermes:", "kilo:"}
@@ -43,10 +45,11 @@ var (
 )
 
 type config struct {
-	listenAddr string
-	backendURL *url.URL
-	slotCount  int
-	transport  http.RoundTripper
+	listenAddr                   string
+	backendURL                   *url.URL
+	slotCount                    int
+	backendResponseHeaderTimeout time.Duration
+	transport                    http.RoundTripper
 }
 
 type affinityEntry struct {
@@ -106,8 +109,13 @@ func main() {
 	}
 
 	handler := newProxyServer(cfg)
-	log.Printf("starting proxy listen_addr=%s backend_url=%s slot_count=%d", cfg.listenAddr, cfg.backendURL.String(), cfg.slotCount)
-	if err := http.ListenAndServe(cfg.listenAddr, handler); err != nil {
+	log.Printf("starting proxy listen_addr=%s backend_url=%s slot_count=%d", cfg.listenAddr, cfg.backendURL.Redacted(), cfg.slotCount)
+	server := &http.Server{
+		Addr:              cfg.listenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: defaultReadHeaderTimeout,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
@@ -116,6 +124,7 @@ func loadConfig() (config, error) {
 	listenAddr := getenvDefault("LISTEN_ADDR", ":8001")
 	backendRaw := getenvDefault("BACKEND_URL", "http://llcpp-backend:8801")
 	slotRaw := getenvDefault("SLOT_COUNT", "4")
+	backendResponseHeaderTimeoutRaw := getenvDefault("BACKEND_RESPONSE_HEADER_TIMEOUT", defaultBackendResponseHeaderTimeout.String())
 
 	backendURL, err := url.Parse(backendRaw)
 	if err != nil {
@@ -133,10 +142,16 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("SLOT_COUNT must be a positive integer")
 	}
 
+	backendResponseHeaderTimeout, err := time.ParseDuration(backendResponseHeaderTimeoutRaw)
+	if err != nil || backendResponseHeaderTimeout <= 0 {
+		return config{}, errors.New("BACKEND_RESPONSE_HEADER_TIMEOUT must be a positive duration")
+	}
+
 	return config{
-		listenAddr: listenAddr,
-		backendURL: backendURL,
-		slotCount:  slotCount,
+		listenAddr:                   listenAddr,
+		backendURL:                   backendURL,
+		slotCount:                    slotCount,
+		backendResponseHeaderTimeout: backendResponseHeaderTimeout,
 	}, nil
 }
 
@@ -152,7 +167,7 @@ func newProxyServer(cfg config) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(cfg.backendURL)
 	transport := cfg.transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = newBackendTransport(cfg.backendResponseHeaderTimeout)
 	}
 	proxy.Transport = &leasingTransport{base: transport}
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
@@ -170,6 +185,19 @@ func newProxyServer(cfg config) http.Handler {
 	mux.HandleFunc("/_affinity", server.handleAffinity)
 	mux.Handle("/", server)
 	return mux
+}
+
+func newBackendTransport(timeout time.Duration) http.RoundTripper {
+	if timeout <= 0 {
+		timeout = defaultBackendResponseHeaderTimeout
+	}
+	baseTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return http.DefaultTransport
+	}
+	transport := baseTransport.Clone()
+	transport.ResponseHeaderTimeout = timeout
+	return transport
 }
 
 func newAffinityManager(slotCount int) *affinityManager {

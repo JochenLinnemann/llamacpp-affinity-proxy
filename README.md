@@ -277,6 +277,7 @@ The proxy uses a multi-stage Docker build and a minimal, non-root runtime image.
 | --- | --- | --- |
 | `LISTEN_ADDR` | `:8001` | Address on which the proxy listens |
 | `BACKEND_URL` | `http://llcpp-backend:8801` | llama.cpp backend URL |
+| `BACKEND_RESPONSE_HEADER_TIMEOUT` | `5m0s` | Maximum time to wait for backend response headers before failing the request |
 | `SLOT_COUNT` | `4` | Number of backend inference slots |
 
 `SLOT_COUNT` should match the effective number of slots configured through `llama.cpp --parallel`.
@@ -291,7 +292,9 @@ Streaming responses are forwarded incrementally using Go's standard-library `htt
 
 The proxy preserves backend status codes, response bodies, content types, and applicable response headers. Client cancellation propagates to the backend request.
 
-Connection failures return HTTP 502. Invalid JSON or invalid/conflicting explicit slots in requests requiring rewriting return HTTP 400.
+The public listener applies a bounded request-header read timeout, and backend response-header waits are limited by `BACKEND_RESPONSE_HEADER_TIMEOUT` without limiting streaming after headers arrive.
+
+Connection failures and backend response-header timeouts return HTTP 502. Invalid JSON or invalid/conflicting explicit slots in requests requiring rewriting return HTTP 400.
 
 ## Diagnostics
 

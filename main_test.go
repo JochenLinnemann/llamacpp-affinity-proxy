@@ -180,6 +180,32 @@ func TestAffinityDefaultClockAdvances(t *testing.T) {
 	}
 }
 
+func TestLoadConfigParsesBackendResponseHeaderTimeout(t *testing.T) {
+	t.Setenv("LISTEN_ADDR", ":9000")
+	t.Setenv("BACKEND_URL", "http://backend.example:8801")
+	t.Setenv("SLOT_COUNT", "2")
+	t.Setenv("BACKEND_RESPONSE_HEADER_TIMEOUT", "42s")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.backendResponseHeaderTimeout != 42*time.Second {
+		t.Fatalf("expected backend response header timeout 42s, got %v", cfg.backendResponseHeaderTimeout)
+	}
+}
+
+func TestNewBackendTransportSetsResponseHeaderTimeout(t *testing.T) {
+	transport, ok := newBackendTransport(42 * time.Second).(*http.Transport)
+	if !ok {
+		t.Fatal("expected *http.Transport")
+	}
+	if transport.ResponseHeaderTimeout != 42*time.Second {
+		t.Fatalf("expected response header timeout 42s, got %v", transport.ResponseHeaderTimeout)
+	}
+}
+
 func TestAffinityConcurrentAssignmentKeepsUniqueSlots(t *testing.T) {
 	const slotCount = 32
 	manager := newAffinityManager(slotCount)
@@ -626,6 +652,7 @@ func TestOversizedRewriteBodyReturnsBadRequest(t *testing.T) {
 }
 
 func TestStreamingResponsesForwardIncrementally(t *testing.T) {
+	allowSecondWrite := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Content-Type", "text/event-stream")
 		flusher, ok := rw.(http.Flusher)
@@ -634,7 +661,7 @@ func TestStreamingResponsesForwardIncrementally(t *testing.T) {
 		}
 		_, _ = rw.Write([]byte("data: first\n\n"))
 		flusher.Flush()
-		time.Sleep(200 * time.Millisecond)
+		<-allowSecondWrite
 		_, _ = rw.Write([]byte("data: second\n\n"))
 		flusher.Flush()
 	}))
@@ -650,7 +677,6 @@ func TestStreamingResponsesForwardIncrementally(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(headerConversation, "chat-1")
 
-	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("do request: %v", err)
@@ -662,12 +688,11 @@ func TestStreamingResponsesForwardIncrementally(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read first chunk: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
-		t.Fatalf("first chunk arrived too late: %v", elapsed)
-	}
 	if firstChunk != "data: first\n" {
 		t.Fatalf("unexpected first chunk %q", firstChunk)
 	}
+
+	close(allowSecondWrite)
 
 	rest, err := io.ReadAll(reader)
 	if err != nil {
