@@ -370,6 +370,47 @@ func TestNegativeExplicitIDSlotReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestNullExplicitIDSlotGetsAssignedByProxy(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		_ = req.Body.Close()
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write(body)
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 4)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test","id_slot":null}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerConversation, "chat-1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["id_slot"] != float64(0) {
+		t.Fatalf("expected proxy-assigned id_slot 0, got %#v", payload["id_slot"])
+	}
+}
+
 func TestStreamingResponsesForwardIncrementally(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Content-Type", "text/event-stream")
@@ -514,6 +555,12 @@ func TestAffinityEndpointRejectsUntrustedCaller(t *testing.T) {
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+}
+
+func TestLoopbackDiagnosticsCallerAcceptsIPv6Zone(t *testing.T) {
+	if !isLoopbackDiagnosticsCaller("[::1%lo0]:1234") {
+		t.Fatal("expected IPv6 loopback with zone to be allowed")
 	}
 }
 

@@ -360,6 +360,9 @@ func isLoopbackDiagnosticsCaller(remoteAddr string) bool {
 	if err != nil {
 		host = remoteAddr
 	}
+	if zoneIndex := strings.Index(host, "%"); zoneIndex >= 0 {
+		host = host[:zoneIndex]
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return false
@@ -399,6 +402,10 @@ func decodeRequestBody(req *http.Request) (map[string]json.RawMessage, *int, err
 		return nil, nil, fmt.Errorf("invalid JSON request body: multiple JSON values are not supported")
 	}
 	if existing, ok := payload["id_slot"]; ok {
+		if bytes.Equal(bytes.TrimSpace(existing), []byte("null")) {
+			delete(payload, "id_slot")
+			return payload, nil, nil
+		}
 		existingSlot, err := decodeExplicitSlot(existing)
 		if err != nil {
 			return nil, nil, errInvalidExplicitSlot
