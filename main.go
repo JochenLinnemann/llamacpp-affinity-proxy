@@ -191,16 +191,7 @@ func (m *affinityManager) acquire(conversationID string, explicitSlot *int) (aff
 			m.convToSlot[conversationID] = slot
 			return affinityResult{slot: slot, action: "assign", lastUsed: now}, nil
 		}
-
-		lruSlot := m.findLRUSlot()
-		if slot != lruSlot {
-			return affinityResult{}, errConflictingExplicitSlot
-		}
-		evicted := entry.conversationID
-		delete(m.convToSlot, evicted)
-		m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now}
-		m.convToSlot[conversationID] = slot
-		return affinityResult{slot: slot, action: "assign", evicted: evicted, lastUsed: now}, nil
+		return affinityResult{}, errConflictingExplicitSlot
 	}
 
 	for slot, entry := range m.slots {

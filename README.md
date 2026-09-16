@@ -148,7 +148,7 @@ Example:
   "slots": [
     {
       "slot": 0,
-      "conversation_id": "hermes:4a1d2c7e9f01",
+      "conversation_id": "hermes:56a3eef54dda",
       "last_used": "2026-09-16T14:00:00Z"
     },
     {
