@@ -11,8 +11,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
       - name: Repo hygiene
         run: |
           test -f README.md
           test -f ARCHITECTURE.md
           test -f DECISIONS.md
+
+      - name: Go test
+        run: go test ./...
+
+      - name: Go test -race
+        run: go test -race ./...
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go build
+        run: go build ./...
