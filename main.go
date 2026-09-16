@@ -35,8 +35,10 @@ var generationPaths = map[string]struct{}{
 }
 
 var (
-	errConflictingExplicitSlot = errors.New("conflicting explicit id_slot in request body")
-	errInvalidExplicitSlot     = errors.New("invalid explicit id_slot in request body")
+	errConflictingExplicitSlot       = errors.New("conflicting explicit id_slot in request body")
+	errInvalidExplicitSlot           = errors.New("invalid explicit id_slot in request body")
+	errRewriteBodyTooLarge           = errors.New("request body too large for id_slot injection")
+	maxRewriteBodyBytes        int64 = 32 << 20
 )
 
 type config struct {
@@ -131,7 +133,6 @@ func getenvDefault(key, fallback string) string {
 func newProxyServer(cfg config) http.Handler {
 	affinity := newAffinityManager(cfg.slotCount)
 	proxy := httputil.NewSingleHostReverseProxy(cfg.backendURL)
-	proxy.FlushInterval = -1
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("backend error method=%s path=%s error=%v", req.Method, req.URL.Path, err)
 		http.Error(rw, "bad gateway", http.StatusBadGateway)
@@ -241,7 +242,7 @@ func (m *affinityManager) Snapshot() affinityView {
 	for slot, entry := range m.slots {
 		slotView := affinitySlotView{Slot: slot}
 		if entry.conversationID != "" {
-			conversationID := entry.conversationID
+			conversationID := redactConversationID(entry.conversationID)
 			lastUsed := entry.lastUsed
 			slotView.ConversationID = &conversationID
 			slotView.LastUsed = &lastUsed
@@ -387,11 +388,14 @@ func shouldInjectSlot(req *http.Request) bool {
 }
 
 func decodeRequestBody(req *http.Request) (map[string]json.RawMessage, *int, error) {
-	body, err := io.ReadAll(req.Body)
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxRewriteBodyBytes+1))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read request body: %w", err)
 	}
 	_ = req.Body.Close()
+	if int64(len(body)) > maxRewriteBodyBytes {
+		return nil, nil, errRewriteBodyTooLarge
+	}
 
 	payload := make(map[string]json.RawMessage)
 	decoder := json.NewDecoder(bytes.NewReader(body))

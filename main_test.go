@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -314,7 +315,7 @@ func TestExplicitIDSlotUsesRequestedFreeSlot(t *testing.T) {
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if view.Slots[3].ConversationID == nil || *view.Slots[3].ConversationID != "owui:chat-1" {
+	if view.Slots[3].ConversationID == nil || *view.Slots[3].ConversationID != redactConversationID("owui:chat-1") {
 		t.Fatalf("expected slot 3 to hold conversation, got %#v", view.Slots[3].ConversationID)
 	}
 }
@@ -374,10 +375,10 @@ func TestConflictingExplicitIDSlotReturnsBadRequestWithoutChangingAffinity(t *te
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 1 || got[0] != "owui:chat-1" {
+	if got := sortedConversations(view); len(got) != 1 || got[0] != redactConversationID("owui:chat-1") {
 		t.Fatalf("expected original affinity assignment to remain unchanged, got %#v", got)
 	}
-	if view.Slots[0].ConversationID == nil || *view.Slots[0].ConversationID != "owui:chat-1" {
+	if view.Slots[0].ConversationID == nil || *view.Slots[0].ConversationID != redactConversationID("owui:chat-1") {
 		t.Fatalf("expected original slot assignment to remain in slot 0, got %#v", view.Slots[0].ConversationID)
 	}
 }
@@ -477,6 +478,39 @@ func TestNullExplicitIDSlotGetsAssignedByProxy(t *testing.T) {
 	}
 }
 
+func TestOversizedRewriteBodyReturnsBadRequest(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		t.Fatal("backend should not receive oversized request")
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 4)
+	defer server.Close()
+
+	previousLimit := maxRewriteBodyBytes
+	maxRewriteBodyBytes = 16
+	defer func() {
+		maxRewriteBodyBytes = previousLimit
+	}()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", bytes.NewBufferString(`{"model":"test","messages":["this is too large"]}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerConversation, "chat-1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
 func TestStreamingResponsesForwardIncrementally(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Content-Type", "text/event-stream")
@@ -561,7 +595,7 @@ func TestAffinityEndpoint(t *testing.T) {
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 1 || got[0] != "hermes:abc" {
+	if got := sortedConversations(view); len(got) != 1 || got[0] != redactConversationID("hermes:abc") {
 		t.Fatalf("unexpected affinity view: %#v", got)
 	}
 }

@@ -56,3 +56,4 @@ Request flow:
 - Must support streaming responses without buffering the whole response.
 - Must not log prompts, API keys, authorization headers, or message bodies.
 - `/_affinity` is intended for loopback callers only.
+- Rewriteable JSON request bodies are capped to bound in-process memory usage.

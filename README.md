@@ -138,7 +138,7 @@ Clients must send one of these headers. The proxy does not infer stable conversa
 ## Diagnostics
 
 - `GET /health` returns `200 OK` when the proxy process is healthy
-- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps for loopback callers only, based on the direct TCP peer address rather than forwarded headers
+- `GET /_affinity` returns redacted in-memory slot mappings and last-used timestamps for loopback callers only, based on the direct TCP peer address rather than forwarded headers
 
 Example:
 
@@ -148,7 +148,7 @@ Example:
   "slots": [
     {
       "slot": 0,
-      "conversation_id": "hermes:abc",
+      "conversation_id": "hermes:4a1d2c7e9f01",
       "last_used": "2026-09-16T14:00:00Z"
     },
     {
@@ -165,8 +165,10 @@ Example:
 - standard-library reverse proxy using `httputil.ReverseProxy`
 - concurrency-safe in-memory slot table guarded by a mutex
 - slot assignment and request-body rewriting only for supported JSON generation endpoints
+- rewriteable JSON request bodies are capped at 32 MiB
 - transparent streaming from backend to client
 - diagnostics restricted to loopback callers, with redacted conversation identifiers in logs
+- diagnostics return redacted conversation identifiers rather than raw client/session IDs
 
 ## Limitations
 
