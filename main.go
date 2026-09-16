@@ -37,6 +37,19 @@ var generationPaths = map[string]struct{}{
 	"/v1/responses":        {},
 }
 
+var backendTransportBaseline = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 var (
 	errConflictingExplicitSlot       = errors.New("conflicting explicit id_slot in request body")
 	errInvalidExplicitSlot           = errors.New("invalid explicit id_slot in request body")
@@ -191,11 +204,7 @@ func newBackendTransport(timeout time.Duration) http.RoundTripper {
 	if timeout <= 0 {
 		timeout = defaultBackendResponseHeaderTimeout
 	}
-	baseTransport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return http.DefaultTransport
-	}
-	transport := baseTransport.Clone()
+	transport := backendTransportBaseline.Clone()
 	transport.ResponseHeaderTimeout = timeout
 	return transport
 }
