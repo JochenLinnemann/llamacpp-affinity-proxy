@@ -1,25 +1,70 @@
 # llamacpp-affinity-proxy
 
-`llamacpp-affinity-proxy` is a small Go reverse proxy that sits in front of `llama.cpp` and assigns a stable `id_slot` to each conversation.
+A lightweight conversation-affinity proxy for `llama.cpp`.
 
-Clients keep talking to:
+`llamacpp-affinity-proxy` keeps long-running LLM conversations attached to the same `llama.cpp` inference slot for as long as possible.
 
-`http://llamacpp:8001`
+This helps improve KV-cache reuse when multiple clients or agent sessions share a `llama-server` running with `--parallel N`.
 
-The proxy forwards requests to:
+## Project status
 
-`http://llcpp-backend:8801`
+This project is in early development. The initial Go implementation is under review in [PR #1](https://github.com/JochenLinnemann/llamacpp-affinity-proxy/pull/1).
 
-## What it does
+The behavior described below represents the intended initial feature set. Build and development instructions apply to a checkout containing the implementation.
 
-- normalizes conversation headers into `X-Conversation-Id`
-- keeps an in-memory `conversation -> slot` affinity table
-- reuses existing slots for returning conversations
-- assigns free slots to new conversations
-- evicts the least recently used conversation when all slots are busy
-- injects `id_slot` into JSON bodies for supported generation endpoints
-- transparently proxies streaming responses without buffering the full response
-- logs slot-affinity decisions without printing raw conversation IDs
+## Why?
+
+`llama.cpp` can retain a conversation's KV state in an inference slot. Reusing that slot with the same prompt prefix can avoid processing large parts of the conversation again.
+
+When multiple clients share a backend, a conversation may return to a different slot:
+
+```text
+Conversation A → Slot 0
+Conversation B → Slot 1
+Conversation C → Slot 2
+Conversation D → Slot 3
+
+later...
+
+Conversation A → Slot 2
+```
+
+If Slot 2 contains a different KV state, much of Conversation A's prompt may need to be processed again.
+
+This becomes particularly expensive with large context windows such as 32K, 64K, or 128K tokens.
+
+`llamacpp-affinity-proxy` adds explicit conversation affinity:
+
+```text
+Conversation A ──────────────→ Slot 0
+Conversation B ──────────────→ Slot 1
+Conversation C ──────────────→ Slot 2
+Conversation D ──────────────→ Slot 3
+                                  │
+                         llama.cpp server
+```
+
+As long as a conversation remains mapped to a slot, subsequent requests are routed back to that slot.
+
+The proxy manages **slot affinity**, not the KV cache itself. `llama.cpp` remains responsible for inference, prompt caching, and KV-cache storage.
+
+## How it works
+
+The proxy sits between OpenAI-compatible clients and `llama.cpp`:
+
+```text
+OpenWebUI ─┐
+Hermes ────┼──→ llamacpp-affinity-proxy ───→ llama.cpp
+Kilo Code ─┘          :8001                    :8801
+```
+
+For supported JSON generation requests, the proxy:
+
+1. reads a stable conversation identifier from request headers;
+2. normalizes the identifier;
+3. assigns or reuses a backend slot;
+4. injects the corresponding `id_slot` into the request body;
+5. forwards the request and streams the backend response.
 
 Supported generation endpoints:
 
@@ -27,16 +72,15 @@ Supported generation endpoints:
 - `POST /v1/completions`
 - `POST /v1/responses`
 
-Additional endpoints:
+Slot injection applies to requests with `Content-Type: application/json`, including parameters such as `charset=utf-8`.
 
-- `GET /health`
-- `GET /_affinity`
+Requests without a supported conversation header are forwarded without dynamic `id_slot` injection. Other endpoints, including model listing, tokenization, and unknown routes, are proxied without slot assignment.
 
-Other routes are transparently proxied.
+The proxy does not interpret prompts, messages, tools, reasoning, multimodal data, or model settings. Request rewriting is limited to the top-level `id_slot` field.
 
-## Conversation header normalization
+## Conversation identifiers
 
-Headers are checked in this priority order:
+Headers are checked in this priority order. The first non-empty value is used:
 
 1. `X-Conversation-Id`
 2. `X-Hermes-Session-Id`
@@ -44,34 +88,148 @@ Headers are checked in this priority order:
 
 Normalization rules:
 
-- `X-Conversation-Id: <id>` -> `owui:<id>` unless already namespaced
-- `X-Hermes-Session-Id: <id>` -> `hermes:<id>`
-- `X-KiloCode-TaskId: <id>` -> `kilo:<id>`
-- already namespaced values such as `owui:...`, `hermes:...`, and `kilo:...` are forwarded unchanged
+| Incoming header | Normalized identifier |
+| --- | --- |
+| `X-Conversation-Id: <id>` | `owui:<id>` |
+| `X-Hermes-Session-Id: <id>` | `hermes:<id>` |
+| `X-KiloCode-TaskId: <id>` | `kilo:<id>` |
 
-If no supported conversation header is present, the proxy does not inject `id_slot`.
+Already namespaced values using `owui:`, `hermes:`, or `kilo:` are preserved without adding another prefix.
 
-## Slot affinity behavior
+The normalized identifier is forwarded as `X-Conversation-Id`. The Hermes and Kilo source headers are removed when an identifier is selected.
 
-Configure the number of backend slots with `SLOT_COUNT`.
+The client must actually provide a stable identifier. The proxy does not infer conversation identity from prompt contents.
 
-- existing conversations always reuse their slot
-- new conversations take a free slot when available
-- when all slots are busy, the least recently used conversation is evicted
-- affinity state is in memory only and is lost on restart
-- KV-cache save/restore is intentionally out of scope for v1
+### OpenWebUI
 
-## Configuration
+Send the chat ID as:
 
-Environment variables:
+```text
+X-Conversation-Id: owui:<chat-id>
+```
 
-- `LISTEN_ADDR` default `:8001`
-- `BACKEND_URL` default `http://llcpp-backend:8801`
-- `SLOT_COUNT` default `4`
+If your OpenWebUI connection supports chat-ID substitution, configure:
 
-The proxy validates configuration on startup and exits with a clear error for invalid values.
+```text
+X-Conversation-Id: owui:{{CHAT_ID}}
+```
 
-## Docker Compose example
+A raw chat ID is also accepted and prefixed with `owui:`.
+
+### Hermes Agent
+
+Send:
+
+```text
+X-Hermes-Session-Id: <stable-session-id>
+```
+
+The proxy forwards:
+
+```text
+X-Conversation-Id: hermes:<stable-session-id>
+```
+
+### Kilo Code
+
+Send:
+
+```text
+X-KiloCode-TaskId: <stable-task-id>
+```
+
+The proxy forwards:
+
+```text
+X-Conversation-Id: kilo:<stable-task-id>
+```
+
+## Dynamic slot assignment
+
+Assume `llama.cpp` runs with:
+
+```text
+--parallel 4
+```
+
+and the proxy is configured with:
+
+```text
+SLOT_COUNT=4
+```
+
+The first conversations are assigned free slots:
+
+```text
+hermes:abc  → Slot 0
+owui:def    → Slot 1
+kilo:ghi    → Slot 2
+owui:jkl    → Slot 3
+```
+
+Further requests from `hermes:abc` reuse Slot 0 while that mapping exists.
+
+When every slot has a mapping and a new conversation arrives, the intended policy is to evict the least recently used conversation:
+
+```text
+before:
+
+Slot 0 → hermes:abc
+Slot 1 → owui:def
+Slot 2 → kilo:ghi
+Slot 3 → owui:jkl
+
+new conversation:
+owui:xyz
+
+after eviction, assuming hermes:abc was least recently used:
+
+Slot 0 → owui:xyz
+Slot 1 → owui:def
+Slot 2 → kilo:ghi
+Slot 3 → owui:jkl
+```
+
+Affinity state is stored in memory and is lost when the proxy restarts. Eviction removes the mapping; it does not save the evicted conversation's KV state.
+
+### Explicit `id_slot`
+
+For requests participating in conversation affinity:
+
+- an existing conversation may specify its currently assigned slot;
+- a new conversation may explicitly select a free slot;
+- a conflicting or out-of-range slot returns HTTP 400;
+- `id_slot: null` is treated as unspecified and replaced with an assigned slot.
+
+Requests without a conversation identifier are passed through, including any client-provided `id_slot`.
+
+Rewritten JSON request bodies are limited to 32 MiB. Oversized bodies are rejected before forwarding.
+
+## Transparent deployment
+
+The proxy can take over the existing `llamacpp` service name:
+
+```text
+before:
+
+client → llamacpp:8001
+
+after:
+
+client → llamacpp:8001
+             │
+             │ affinity proxy
+             ▼
+        llcpp-backend:8801
+             │
+             │ llama.cpp
+             ▼
+            GPU
+```
+
+Existing applications can keep their host and port configuration. To enable affinity, they add one of the supported conversation headers.
+
+Example Docker Compose layout:
 
 ```yaml
 services:
@@ -83,7 +241,8 @@ services:
     ports:
       - "8001:8001"
     environment:
-      BACKEND_URL: http://llcpp-backend:8801
+      LISTEN_ADDR: ":8001"
+      BACKEND_URL: "http://llcpp-backend:8801"
       SLOT_COUNT: "4"
     depends_on:
       - llcpp-backend
@@ -92,6 +251,9 @@ services:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan
     container_name: llcpp-backend
     restart: unless-stopped
+
+    # Add GPU/device configuration for your environment.
+
     command:
       - --host
       - "0.0.0.0"
@@ -99,48 +261,59 @@ services:
       - "8801"
       - --parallel
       - "4"
+
+      # Add your model and remaining llama.cpp options.
 ```
 
-Do not publish port `8801` to the host unless you explicitly need it for debugging.
+This is a deployment layout, not a complete model configuration. Add the required model options, mounts, and GPU/device settings.
 
-## Client examples
+The backend port does not need to be published to the host when both services share the same Docker network.
 
-### OpenWebUI
+The proxy uses a multi-stage Docker build and a minimal, non-root runtime image. It requires no writable filesystem state.
 
-Send:
+## Configuration
 
-`X-Conversation-Id: owui:{{CHAT_ID}}`
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LISTEN_ADDR` | `:8001` | Address on which the proxy listens |
+| `BACKEND_URL` | `http://llcpp-backend:8801` | llama.cpp backend URL |
+| `SLOT_COUNT` | `4` | Number of backend inference slots |
 
-If OpenWebUI sends the raw chat ID instead, the proxy prefixes it with `owui:`.
+`SLOT_COUNT` should match the effective number of slots configured through `llama.cpp --parallel`.
 
-### Hermes
+`BACKEND_URL` must include an HTTP or HTTPS scheme and a host. `SLOT_COUNT` must be a positive integer.
 
-Send:
+Backend availability is not required for the proxy process to start.
 
-`X-Hermes-Session-Id: <stable-session-id>`
+## Streaming and errors
 
-The proxy forwards:
+Streaming responses are forwarded incrementally using Go's standard-library `httputil.ReverseProxy`.
 
-`X-Conversation-Id: hermes:<stable-session-id>`
+The proxy preserves backend status codes, response bodies, content types, and applicable response headers. Client cancellation propagates to the backend request.
 
-### Kilo
-
-Send:
-
-`X-KiloCode-TaskId: <stable-task-id>`
-
-The proxy forwards:
-
-`X-Conversation-Id: kilo:<stable-task-id>`
-
-Clients must send one of these headers. The proxy does not infer stable conversation IDs from the request body.
+Connection failures return HTTP 502. Invalid JSON or invalid/conflicting explicit slots in requests requiring rewriting return HTTP 400.
 
 ## Diagnostics
 
-- `GET /health` returns `200 OK` when the proxy process is healthy
-- `GET /_affinity` returns redacted in-memory slot mappings and last-used timestamps for loopback callers only, based on the direct TCP peer address rather than forwarded headers
+### Process health
 
-Example:
+```text
+GET /health
+```
+
+Returns `200 OK` when the proxy process is serving requests. This is a process health check, not a backend readiness check.
+
+### Affinity state
+
+```text
+GET /_affinity
+```
+
+Returns the current slot mappings and last-used timestamps.
+
+Access is restricted to loopback callers using the direct TCP peer address. Forwarded headers do not grant access. In Docker, callers must connect from within the proxy container's network namespace.
+
+Conversation identifiers are redacted:
 
 ```json
 {
@@ -154,40 +327,70 @@ Example:
     {
       "slot": 1,
       "conversation_id": null
+    },
+    {
+      "slot": 2,
+      "conversation_id": null
+    },
+    {
+      "slot": 3,
+      "conversation_id": null
     }
   ]
 }
 ```
 
-## Architecture summary
+Operational logs record assignments, reuse, evictions, and backend errors using redacted conversation identifiers. Prompts, message bodies, API keys, and authorization headers are not intentionally logged.
 
-- standard-library HTTP server using `net/http`
-- standard-library reverse proxy using `httputil.ReverseProxy`
-- concurrency-safe in-memory slot table guarded by a mutex
-- slot assignment and request-body rewriting only for supported JSON generation endpoints
-- rewriteable JSON request bodies are capped at 32 MiB
-- transparent streaming from backend to client
-- diagnostics restricted to loopback callers, with redacted conversation identifiers in logs
-- diagnostics return redacted conversation identifiers rather than raw client/session IDs
+## Scope and limitations
 
-## Limitations
+The project has a narrow responsibility:
 
-Version 1 intentionally does not implement:
+> Maintain conversation-to-slot affinity in front of a parallel llama.cpp server.
 
-- KV save/restore
-- persistent affinity storage
-- Redis or database state
-- authentication
-- Prometheus metrics
-- automatic conversation detection from prompts or messages
-- retries on different slots
+The initial implementation does not provide:
+
+- KV-cache serialization or save/restore;
+- RAM or SSD KV-cache offloading;
+- persistent affinity mappings across restarts;
+- coordination across multiple proxy instances;
+- prompt hashing or prompt-based conversation detection;
+- authentication or rate limiting;
+- model management;
+- proxy-managed request queues;
+- automatic retries on different slots;
+- Prometheus metrics;
+- distributed inference.
+
+It is designed for one proxy process in front of one backend. Requests that bypass affinity can still use backend slots and affect their cached contents.
+
+## Why not save and restore KV caches?
+
+`llama.cpp` provides mechanisms for saving and restoring slot state, but compatibility and behavior depend on the backend configuration and inference features.
+
+The first goal is to reduce unnecessary slot changes. KV persistence may become an optional extension later.
+
+## Design principles
+
+The proxy should remain:
+
+- **transparent** — existing OpenAI-compatible clients should continue to work;
+- **small** — a Go service using the standard library;
+- **streaming-safe** — SSE responses must not be buffered in full;
+- **model-agnostic** — no assumptions about a particular model or quantization;
+- **runtime-focused** — prompts and messages are not interpreted;
+- **observable** — affinity decisions are visible without logging prompt contents;
+- **simple to operate** — no persistent infrastructure is required.
 
 ## Local development
 
-Run tests:
+Use Go 1.24 or later.
+
+Run tests and static checks:
 
 ```bash
 go test ./...
+go test -race ./...
 go vet ./...
 ```
 
@@ -197,8 +400,33 @@ Build:
 go build ./...
 ```
 
-Run locally:
+Run against a local backend:
 
 ```bash
-LISTEN_ADDR=:8001 BACKEND_URL=http://localhost:8801 SLOT_COUNT=4 go run .
+LISTEN_ADDR=:8001 \
+BACKEND_URL=http://localhost:8801 \
+SLOT_COUNT=4 \
+go run .
 ```
+
+Example request:
+
+```bash
+curl http://localhost:8001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Hermes-Session-Id: example-session' \
+  -d '{
+    "model": "local-model",
+    "messages": [
+      {"role": "user", "content": "Hello!"}
+    ],
+    "stream": true
+  }' \
+  --no-buffer
+```
+
+See [ROADMAP.md](ROADMAP.md) for planned work, [ARCHITECTURE.md](ARCHITECTURE.md) for architectural notes, and [DECISIONS.md](DECISIONS.md) for design decisions.
+
+## License
+
+MIT
