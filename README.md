@@ -138,7 +138,7 @@ Clients must send one of these headers. The proxy does not infer stable conversa
 ## Diagnostics
 
 - `GET /health` returns `200 OK` when the proxy process is healthy
-- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps for loopback callers only
+- `GET /_affinity` returns the current in-memory slot mapping and last-used timestamps for loopback callers only, based on the direct TCP peer address rather than forwarded headers
 
 Example:
 

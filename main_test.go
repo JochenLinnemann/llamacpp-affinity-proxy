@@ -225,9 +225,15 @@ func TestRequestsWithoutConversationHeadersPassThroughWithoutIDSlot(t *testing.T
 	}
 }
 
-func TestConflictingExplicitIDSlotReturnsBadRequestWithoutChangingAffinity(t *testing.T) {
+func TestExplicitIDSlotUsesRequestedFreeSlot(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		t.Fatal("backend should not receive conflicting request")
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		_ = req.Body.Close()
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write(body)
 	}))
 	defer backend.Close()
 
@@ -237,6 +243,74 @@ func TestConflictingExplicitIDSlotReturnsBadRequestWithoutChangingAffinity(t *te
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test","id_slot":3}`))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerConversation, "chat-1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["id_slot"] != float64(3) {
+		t.Fatalf("expected id_slot 3, got %#v", payload["id_slot"])
+	}
+
+	affinityResp, err := http.Get(server.URL + "/_affinity")
+	if err != nil {
+		t.Fatalf("get affinity: %v", err)
+	}
+	defer affinityResp.Body.Close()
+
+	var view affinityView
+	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
+		t.Fatalf("decode affinity: %v", err)
+	}
+	if view.Slots[3].ConversationID == nil || *view.Slots[3].ConversationID != "owui:chat-1" {
+		t.Fatalf("expected slot 3 to hold conversation, got %#v", view.Slots[3].ConversationID)
+	}
+}
+
+func TestConflictingExplicitIDSlotReturnsBadRequestWithoutChangingAffinity(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		_ = req.Body.Close()
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write(body)
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 4)
+	defer server.Close()
+
+	firstReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+	if err != nil {
+		t.Fatalf("new first request: %v", err)
+	}
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstReq.Header.Set(headerConversation, "chat-1")
+
+	firstResp, err := http.DefaultClient.Do(firstReq)
+	if err != nil {
+		t.Fatalf("do first request: %v", err)
+	}
+	firstResp.Body.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test","id_slot":1}`))
+	if err != nil {
+		t.Fatalf("new conflicting request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(headerConversation, "chat-1")
@@ -261,8 +335,38 @@ func TestConflictingExplicitIDSlotReturnsBadRequestWithoutChangingAffinity(t *te
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 0 {
-		t.Fatalf("expected no affinity assignment, got %#v", got)
+	if got := sortedConversations(view); len(got) != 1 || got[0] != "owui:chat-1" {
+		t.Fatalf("expected original affinity assignment to remain unchanged, got %#v", got)
+	}
+	if view.Slots[0].ConversationID == nil || *view.Slots[0].ConversationID != "owui:chat-1" {
+		t.Fatalf("expected original slot assignment to remain in slot 0, got %#v", view.Slots[0].ConversationID)
+	}
+}
+
+func TestNegativeExplicitIDSlotReturnsBadRequest(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		t.Fatal("backend should not receive invalid request")
+	}))
+	defer backend.Close()
+
+	server := newProxyTestServer(t, backend.URL, 4)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"test","id_slot":-1}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerConversation, "chat-1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 }
 

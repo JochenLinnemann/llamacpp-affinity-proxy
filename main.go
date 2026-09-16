@@ -34,6 +34,11 @@ var generationPaths = map[string]struct{}{
 	"/v1/responses":        {},
 }
 
+var (
+	errConflictingExplicitSlot = errors.New("conflicting explicit id_slot in request body")
+	errInvalidExplicitSlot     = errors.New("invalid explicit id_slot in request body")
+)
+
 type config struct {
 	listenAddr string
 	backendURL *url.URL
@@ -166,40 +171,62 @@ func (m *affinityManager) acquire(conversationID string, explicitSlot *int) (aff
 	defer m.mu.Unlock()
 
 	now := m.now()
+	if explicitSlot != nil && (*explicitSlot < 0 || *explicitSlot >= len(m.slots)) {
+		return affinityResult{}, errInvalidExplicitSlot
+	}
 	if slot, ok := m.convToSlot[conversationID]; ok {
 		if explicitSlot != nil && *explicitSlot != slot {
-			return affinityResult{}, errors.New("conflicting explicit id_slot in request body")
+			return affinityResult{}, errConflictingExplicitSlot
 		}
 		m.slots[slot].lastUsed = now
 		return affinityResult{slot: slot, action: "reuse", lastUsed: now}, nil
 	}
 
+	if explicitSlot != nil {
+		slot := *explicitSlot
+		entry := m.slots[slot]
+		if entry.conversationID == "" {
+			m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now}
+			m.convToSlot[conversationID] = slot
+			return affinityResult{slot: slot, action: "assign", lastUsed: now}, nil
+		}
+
+		lruSlot := m.findLRUSlot()
+		if slot != lruSlot {
+			return affinityResult{}, errConflictingExplicitSlot
+		}
+		evicted := entry.conversationID
+		delete(m.convToSlot, evicted)
+		m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now}
+		m.convToSlot[conversationID] = slot
+		return affinityResult{slot: slot, action: "assign", evicted: evicted, lastUsed: now}, nil
+	}
+
 	for slot, entry := range m.slots {
 		if entry.conversationID == "" {
-			if explicitSlot != nil && *explicitSlot != slot {
-				return affinityResult{}, errors.New("conflicting explicit id_slot in request body")
-			}
 			m.slots[slot] = affinityEntry{conversationID: conversationID, lastUsed: now}
 			m.convToSlot[conversationID] = slot
 			return affinityResult{slot: slot, action: "assign", lastUsed: now}, nil
 		}
 	}
 
-	lruSlot := 0
-	for slot := 1; slot < len(m.slots); slot++ {
-		if m.slots[slot].lastUsed.Before(m.slots[lruSlot].lastUsed) {
-			lruSlot = slot
-		}
-	}
-	if explicitSlot != nil && *explicitSlot != lruSlot {
-		return affinityResult{}, errors.New("conflicting explicit id_slot in request body")
-	}
+	lruSlot := m.findLRUSlot()
 
 	evicted := m.slots[lruSlot].conversationID
 	delete(m.convToSlot, evicted)
 	m.slots[lruSlot] = affinityEntry{conversationID: conversationID, lastUsed: now}
 	m.convToSlot[conversationID] = lruSlot
 	return affinityResult{slot: lruSlot, action: "assign", evicted: evicted, lastUsed: now}, nil
+}
+
+func (m *affinityManager) findLRUSlot() int {
+	lruSlot := 0
+	for slot := 1; slot < len(m.slots); slot++ {
+		if m.slots[slot].lastUsed.Before(m.slots[lruSlot].lastUsed) {
+			lruSlot = slot
+		}
+	}
+	return lruSlot
 }
 
 func (m *affinityManager) Snapshot() affinityView {
@@ -374,7 +401,7 @@ func decodeRequestBody(req *http.Request) (map[string]json.RawMessage, *int, err
 	if existing, ok := payload["id_slot"]; ok {
 		existingSlot, err := decodeExplicitSlot(existing)
 		if err != nil {
-			return nil, nil, fmt.Errorf("conflicting explicit id_slot in request body")
+			return nil, nil, errInvalidExplicitSlot
 		}
 		return payload, &existingSlot, nil
 	}
