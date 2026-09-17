@@ -85,6 +85,8 @@ Headers are checked in this priority order. The first non-empty value is used:
 1. `X-Conversation-Id`
 2. `X-Hermes-Session-Id`
 3. `X-KiloCode-TaskId`
+4. `X-Session-Id`
+5. `X-Session-Affinity`
 
 Normalization rules:
 
@@ -93,10 +95,12 @@ Normalization rules:
 | `X-Conversation-Id: <id>` | `owui:<id>` |
 | `X-Hermes-Session-Id: <id>` | `hermes:<id>` |
 | `X-KiloCode-TaskId: <id>` | `kilo:<id>` |
+| `X-Session-Id: <id>` | `kilo:<id>` |
+| `X-Session-Affinity: <id>` | `kilo:<id>` |
 
 Already namespaced values using `owui:`, `hermes:`, or `kilo:` are preserved without adding another prefix.
 
-The normalized identifier is forwarded as `X-Conversation-Id`. The Hermes and Kilo source headers are removed when an identifier is selected.
+The normalized identifier is forwarded as `X-Conversation-Id`. The Hermes and all Kilo source headers are removed when an identifier is selected. Conversation IDs are written unredacted to affinity log messages and to the loopback-only `/_affinity` diagnostics endpoint; protect access to the proxy and its logs accordingly.
 
 The client must actually provide a stable identifier. The proxy does not infer conversation identity from prompt contents.
 
