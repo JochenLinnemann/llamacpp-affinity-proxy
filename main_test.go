@@ -38,23 +38,97 @@ func TestNormalizeConversationIDHermes(t *testing.T) {
 	}
 }
 
-func TestNormalizeConversationIDKilo(t *testing.T) {
-	headers := http.Header{}
-	headers.Set(headerKilo, "task-123")
-
-	got, ok := normalizeConversationID(headers)
-	if !ok || got != "kilo:task-123" {
-		t.Fatalf("normalizeConversationID() = %q, %t", got, ok)
+func TestNormalizeConversationID(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers http.Header
+		want    string
+		ok      bool
+	}{
+		{
+			name:    "Kilo task ID",
+			headers: testHeaders(headerKilo, "task-123"),
+			want:    "kilo:task-123",
+			ok:      true,
+		},
+		{
+			name:    "Kilo session ID fallback",
+			headers: testHeaders(headerKiloSession, "session-123"),
+			want:    "kilo:session-123",
+			ok:      true,
+		},
+		{
+			name:    "Kilo affinity fallback",
+			headers: testHeaders(headerKiloAffinity, "affinity-123"),
+			want:    "kilo:affinity-123",
+			ok:      true,
+		},
+		{
+			name: "priority ignores lower-priority headers",
+			headers: testHeaders(
+				headerConversation, "chat-123",
+				headerHermes, "session-123",
+				headerKilo, "task-123",
+			),
+			want: "owui:chat-123",
+			ok:   true,
+		},
+		{
+			name: "Kilo task ID takes priority over session and affinity IDs",
+			headers: testHeaders(
+				headerKilo, "task-123",
+				headerKiloSession, "session-123",
+				headerKiloAffinity, "affinity-123",
+			),
+			want: "kilo:task-123",
+			ok:   true,
+		},
+		{
+			name: "empty higher-priority headers fall back",
+			headers: testHeaders(
+				headerConversation, "  ",
+				headerHermes, "",
+				headerKilo, "task-123",
+			),
+			want: "kilo:task-123",
+			ok:   true,
+		},
+		{
+			name: "empty headers return no ID",
+			headers: testHeaders(
+				headerConversation, " ",
+				headerHermes, "",
+				headerKilo, "\t",
+			),
+			ok: false,
+		},
+		{
+			name:    "existing OpenWebUI namespace",
+			headers: testHeaders(headerConversation, "owui:chat-123"),
+			want:    "owui:chat-123",
+			ok:      true,
+		},
+		{
+			name:    "existing Hermes namespace",
+			headers: testHeaders(headerHermes, "hermes:session-123"),
+			want:    "hermes:session-123",
+			ok:      true,
+		},
+		{
+			name:    "existing Kilo namespace",
+			headers: testHeaders(headerKilo, "kilo:task-123"),
+			want:    "kilo:task-123",
+			ok:      true,
+		},
 	}
-}
 
-func TestNormalizeConversationIDDoesNotDoublePrefix(t *testing.T) {
-	headers := http.Header{}
-	headers.Set(headerConversation, "hermes:session-123")
-
-	got, ok := normalizeConversationID(headers)
-	if !ok || got != "hermes:session-123" {
-		t.Fatalf("normalizeConversationID() = %q, %t", got, ok)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := normalizeConversationID(tt.headers)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("normalizeConversationID() = %q, %t; want %q, %t", got, ok, tt.want, tt.ok)
+			}
+		})
 	}
 }
 
@@ -62,9 +136,11 @@ func TestProxyForwardsOnlyNormalizedConversationHeader(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(rw).Encode(map[string]any{
-			"conversation": req.Header.Get(headerConversation),
-			"hermes":       req.Header.Get(headerHermes),
-			"kilo":         req.Header.Get(headerKilo),
+			"conversation":  req.Header.Get(headerConversation),
+			"hermes":        req.Header.Get(headerHermes),
+			"kilo":          req.Header.Get(headerKilo),
+			"kilo_session":  req.Header.Get(headerKiloSession),
+			"kilo_affinity": req.Header.Get(headerKiloAffinity),
 		})
 	}))
 	defer backend.Close()
@@ -78,6 +154,8 @@ func TestProxyForwardsOnlyNormalizedConversationHeader(t *testing.T) {
 	}
 	req.Header.Set(headerHermes, "session-123")
 	req.Header.Set(headerKilo, "task-123")
+	req.Header.Set(headerKiloSession, "session-fallback-123")
+	req.Header.Set(headerKiloAffinity, "affinity-123")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -92,7 +170,7 @@ func TestProxyForwardsOnlyNormalizedConversationHeader(t *testing.T) {
 	if payload["conversation"] != "hermes:session-123" {
 		t.Fatalf("expected normalized conversation header, got %#v", payload)
 	}
-	if payload["hermes"] != "" || payload["kilo"] != "" {
+	if payload["hermes"] != "" || payload["kilo"] != "" || payload["kilo_session"] != "" || payload["kilo_affinity"] != "" {
 		t.Fatalf("expected source headers to be removed, got %#v", payload)
 	}
 }
@@ -413,7 +491,7 @@ func TestExplicitIDSlotUsesRequestedFreeSlot(t *testing.T) {
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if view.Slots[3].ConversationID == nil || *view.Slots[3].ConversationID != redactConversationID("owui:chat-1") {
+	if view.Slots[3].ConversationID == nil || *view.Slots[3].ConversationID != "owui:chat-1" {
 		t.Fatalf("expected slot 3 to hold conversation, got %#v", view.Slots[3].ConversationID)
 	}
 }
@@ -473,10 +551,10 @@ func TestConflictingExplicitIDSlotReturnsBadRequestWithoutChangingAffinity(t *te
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 1 || got[0] != redactConversationID("owui:chat-1") {
+	if got := sortedConversations(view); len(got) != 1 || got[0] != "owui:chat-1" {
 		t.Fatalf("expected original affinity assignment to remain unchanged, got %#v", got)
 	}
-	if view.Slots[0].ConversationID == nil || *view.Slots[0].ConversationID != redactConversationID("owui:chat-1") {
+	if view.Slots[0].ConversationID == nil || *view.Slots[0].ConversationID != "owui:chat-1" {
 		t.Fatalf("expected original slot assignment to remain in slot 0, got %#v", view.Slots[0].ConversationID)
 	}
 }
@@ -962,7 +1040,7 @@ func TestAffinityEndpoint(t *testing.T) {
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 1 || got[0] != redactConversationID("hermes:abc") {
+	if got := sortedConversations(view); len(got) != 1 || got[0] != "hermes:abc" {
 		t.Fatalf("unexpected affinity view: %#v", got)
 	}
 }
@@ -1042,6 +1120,14 @@ func newProxyTestServer(t *testing.T, backend string, slotCount int) *httptest.S
 		backendURL: backendURL,
 		slotCount:  slotCount,
 	}))
+}
+
+func testHeaders(values ...string) http.Header {
+	headers := http.Header{}
+	for index := 0; index < len(values); index += 2 {
+		headers.Set(values[index], values[index+1])
+	}
+	return headers
 }
 
 func newProxyTestServerWithTransport(t *testing.T, backend string, slotCount int, transport http.RoundTripper) *httptest.Server {
