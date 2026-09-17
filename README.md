@@ -320,7 +320,7 @@ Returns the current slot mappings and last-used timestamps.
 
 Access is restricted to loopback callers using the direct TCP peer address. Forwarded headers do not grant access. In Docker, callers must connect from within the proxy container's network namespace.
 
-Conversation identifiers are redacted:
+Conversation identifiers are returned unredacted:
 
 ```json
 {
@@ -328,7 +328,7 @@ Conversation identifiers are redacted:
   "slots": [
     {
       "slot": 0,
-      "conversation_id": "hermes:56a3eef54dda",
+      "conversation_id": "hermes:stable-session-123",
       "last_used": "2026-09-16T14:00:00Z"
     },
     {
@@ -347,7 +347,7 @@ Conversation identifiers are redacted:
 }
 ```
 
-Operational logs record assignments, reuse, evictions, and backend errors using redacted conversation identifiers. Prompts, message bodies, API keys, and authorization headers are not intentionally logged.
+Operational logs record assignments, reuse, and evictions using unredacted conversation identifiers. Prompts, message bodies, API keys, and authorization headers are not intentionally logged.
 
 ## Scope and limitations
 
