@@ -330,7 +330,7 @@ func (m *affinityManager) Snapshot() affinityView {
 	for slot, entry := range m.slots {
 		slotView := affinitySlotView{Slot: slot}
 		if entry.conversationID != "" {
-			conversationID := redactConversationID(entry.conversationID)
+			conversationID := entry.conversationID
 			lastUsed := entry.lastUsed
 			slotView.ConversationID = &conversationID
 			slotView.LastUsed = &lastUsed
@@ -372,11 +372,10 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 			defer reservation.lease.Release()
 			affinity := reservation.result
-			logConversationID := redactConversationID(normalizedID)
 			if affinity.evicted == "" {
-				log.Printf("affinity conversation=%s slot=%d action=%s", logConversationID, affinity.slot, affinity.action)
+				log.Printf("affinity conversation=%s slot=%d action=%s", normalizedID, affinity.slot, affinity.action)
 			} else {
-				log.Printf("affinity conversation=%s slot=%d action=%s evicted=%s", logConversationID, affinity.slot, affinity.action, redactConversationID(affinity.evicted))
+				log.Printf("affinity conversation=%s slot=%d action=%s evicted=%s", normalizedID, affinity.slot, affinity.action, affinity.evicted)
 			}
 			if explicitSlot == nil {
 				payload["id_slot"] = json.RawMessage(strconv.Itoa(affinity.slot))
@@ -442,15 +441,6 @@ func hasNamespace(value string) bool {
 		}
 	}
 	return false
-}
-
-func redactConversationID(conversationID string) string {
-	namespace := "conversation"
-	if parts := strings.SplitN(conversationID, ":", 2); len(parts) == 2 && parts[0] != "" {
-		namespace = strings.ToLower(parts[0])
-	}
-	sum := sha256.Sum256([]byte(conversationID))
-	return fmt.Sprintf("%s:%x", namespace, sum[:6])
 }
 
 func isLoopbackDiagnosticsCaller(remoteAddr string) bool {
