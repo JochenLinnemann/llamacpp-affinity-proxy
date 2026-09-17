@@ -74,6 +74,16 @@ func TestNormalizeConversationID(t *testing.T) {
 			ok:   true,
 		},
 		{
+			name: "Kilo task ID takes priority over session and affinity IDs",
+			headers: testHeaders(
+				headerKilo, "task-123",
+				headerKiloSession, "session-123",
+				headerKiloAffinity, "affinity-123",
+			),
+			want: "kilo:task-123",
+			ok:   true,
+		},
+		{
 			name: "empty higher-priority headers fall back",
 			headers: testHeaders(
 				headerConversation, "  ",
