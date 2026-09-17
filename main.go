@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -347,7 +346,7 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	normalizedID, hasConversation := normalizeConversationID(req.Header)
 	if hasConversation {
 		req.Header.Set(headerConversation, normalizedID)
-		
+
 		req.Header.Del(headerHermes)
 		req.Header.Del(headerKilo)
         req.Header.Del(headerKiloSession)
