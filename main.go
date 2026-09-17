@@ -25,6 +25,8 @@ const (
 	headerConversation                  = "X-Conversation-Id"
 	headerHermes                        = "X-Hermes-Session-Id"
 	headerKilo                          = "X-KiloCode-TaskId"
+    headerKiloSession                   = "X-Session-Id"
+    headerKiloAffinity                  = "X-Session-Affinity"
 	defaultReadHeaderTimeout            = 10 * time.Second
 	defaultBackendResponseHeaderTimeout = 5 * time.Minute
 )
@@ -345,8 +347,11 @@ func (s *proxyServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	normalizedID, hasConversation := normalizeConversationID(req.Header)
 	if hasConversation {
 		req.Header.Set(headerConversation, normalizedID)
+		
 		req.Header.Del(headerHermes)
 		req.Header.Del(headerKilo)
+        req.Header.Del(headerKiloSession)
+        req.Header.Del(headerKiloAffinity)
 	}
 
 	if hasConversation {
@@ -420,6 +425,8 @@ func normalizeConversationID(headers http.Header) (string, bool) {
 		{header: headerConversation, prefix: "owui:"},
 		{header: headerHermes, prefix: "hermes:"},
 		{header: headerKilo, prefix: "kilo:"},
+        {header: headerKiloSession, prefix: "kilo:"},
+        {header: headerKiloAffinity, prefix: "kilo:"},
 	} {
 		value := strings.TrimSpace(headers.Get(candidate.header))
 		if value == "" {
