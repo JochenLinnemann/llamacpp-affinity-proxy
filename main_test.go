@@ -413,7 +413,7 @@ func TestExplicitIDSlotUsesRequestedFreeSlot(t *testing.T) {
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if view.Slots[3].ConversationID == nil || *view.Slots[3].ConversationID != redactConversationID("owui:chat-1") {
+	if view.Slots[3].ConversationID == nil || *view.Slots[3].ConversationID != "owui:chat-1" {
 		t.Fatalf("expected slot 3 to hold conversation, got %#v", view.Slots[3].ConversationID)
 	}
 }
@@ -473,10 +473,10 @@ func TestConflictingExplicitIDSlotReturnsBadRequestWithoutChangingAffinity(t *te
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 1 || got[0] != redactConversationID("owui:chat-1") {
+	if got := sortedConversations(view); len(got) != 1 || got[0] != "owui:chat-1" {
 		t.Fatalf("expected original affinity assignment to remain unchanged, got %#v", got)
 	}
-	if view.Slots[0].ConversationID == nil || *view.Slots[0].ConversationID != redactConversationID("owui:chat-1") {
+	if view.Slots[0].ConversationID == nil || *view.Slots[0].ConversationID != "owui:chat-1" {
 		t.Fatalf("expected original slot assignment to remain in slot 0, got %#v", view.Slots[0].ConversationID)
 	}
 }
@@ -962,7 +962,7 @@ func TestAffinityEndpoint(t *testing.T) {
 	if err := json.NewDecoder(affinityResp.Body).Decode(&view); err != nil {
 		t.Fatalf("decode affinity: %v", err)
 	}
-	if got := sortedConversations(view); len(got) != 1 || got[0] != redactConversationID("hermes:abc") {
+	if got := sortedConversations(view); len(got) != 1 || got[0] != "hermes:abc" {
 		t.Fatalf("unexpected affinity view: %#v", got)
 	}
 }
